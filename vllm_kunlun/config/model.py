@@ -5,6 +5,7 @@ def is_deepseek_mla(self) -> bool:
         "deepseek_v2",
         "deepseek_v3",
         "deepseek_v32",
+        "deepseek_v4",
         "deepseek_mtp",
         "kimi_k2",
         "longcat_flash",
