@@ -300,7 +300,7 @@ class KunlunPlatform(Platform):
         """
         Set the device for the current platform.
         """
-        torch.cuda.set_device(device)
+        torch.cuda.set_device(int(str(device).split(":")[-1]) % 8)
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
