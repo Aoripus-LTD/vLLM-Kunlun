@@ -23,6 +23,30 @@ Notes:
   - Expected runtime: 30-60 min on CPU, ~5-10 min on XPU
 """
 
+# CRITICAL: Container's torch is older and lacks torch.float8_e8m0fnu.
+# safetensors tries to access this attribute when loading FP8 e4m3fn + e8m0fnu scale
+# weight pairs. We monkey-patch it to uint8 (e8m0fnu IS 1 byte) and decode
+# the E8M0 exponents ourselves via bitwise math.
+import torch as _torch
+if not hasattr(_torch, "float8_e8m0fnu"):
+    _torch.float8_e8m0fnu = _torch.uint8  # E8M0 is 1-byte; we handle decode manually
+# Also patch the dtypes mapping that safetensors/torch.py uses internally
+if not hasattr(_torch, "finfo"):
+    pass  # finfo is fine in any modern torch
+# Some safetensors versions do `torch.finfo(torch.float8_e8m0fnu)` which would fail.
+# Guard that too by pre-creating a minimal finfo.
+try:
+    _torch.finfo(_torch.float8_e8m0fnu)
+except (AttributeError, TypeError):
+    class _DummyFinfo:
+        bits = 8
+        min = 0.0
+        max = 1.0
+        eps = 0.0
+        smallest_normal = 0.0
+        tiny = 0.0
+    _torch.finfo = lambda dtype: _DummyFinfo()
+
 import argparse
 import json
 import os
