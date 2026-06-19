@@ -9,6 +9,7 @@ def is_deepseek_mla(self) -> bool:
         "kimi_k2",
         "longcat_flash",
         "glm_moe_dsa",
+        "chatglm",  # GLM-5.1 uses model_type=chatglm; kv_lora_rank guard filters legacy
     ):
         return self.hf_text_config.kv_lora_rank is not None
     elif self.hf_text_config.model_type == "eagle":
