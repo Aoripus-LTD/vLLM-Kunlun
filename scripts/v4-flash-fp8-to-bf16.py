@@ -34,11 +34,11 @@ import json
 import os
 import re
 import shutil
+import struct
 from glob import glob
 from tqdm import tqdm
 
 import torch
-from safetensors import safe_open
 from safetensors.torch import save_file
 
 
@@ -102,27 +102,42 @@ def is_expert_weight(name: str) -> bool:
 
 def load_shard_safetensors(path):
     """
-    Load all tensors from a safetensors shard using safe_open + get_slice +
-    get_data() to bypass the safetensors dtype system entirely.
+    Hand-parse a safetensors shard to bypass the safetensors dtype system
+    entirely.
 
-    safetensors.torch.load_file references torch.float8_e8m0fnu in its
-    internal DTYPE_MAP at import time, which the container's older
-    torch lacks. Monkey-patching torch after the fact does not help
-    because the DTYPE_MAP dict was already built. This helper reads
-    raw bytes per tensor and constructs the torch tensor manually
-    with a safe dtype (uint8 for any float8 variant).
+    Why hand-parse:
+      - safetensors 0.7.0 (the container's version) has PySafeSlice with
+        only get_dtype() and get_shape(); get_data() does NOT exist on it.
+      - safe_open(framework="np") fails with "data type 'bfloat16' not
+        understood" because this old safetensors' numpy backend doesn't
+        know how to map the BF16 dtype string to a numpy dtype on this
+        platform's numpy build.
+      - safe_open(framework="pt") + get_tensor() triggers the
+        torch.float8_e8m0fnu attribute lookup that the container's older
+        torch lacks.
+
+    So we parse the file format directly. The safetensors layout is:
+      [8 bytes LE uint64 header_len][JSON header (header_len bytes)][raw data]
+    The JSON header maps tensor name -> {dtype, shape, data_offsets} where
+    data_offsets is [start, end] byte offsets into the raw data section.
     """
     tensors = {}
-    with safe_open(path, framework="pt") as f:
-        meta = f.metadata() or {}
-        for key in f.keys():
-            slice_ = f.get_slice(key)
-            dtype_str = meta[key]["dtype"] if key in meta else None
-            shape = slice_.get_shape()
-            raw = bytes(slice_.get_data())
+    with open(path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len).decode("utf-8"))
+        data_section_offset = 8 + header_len
+        for key, meta in header.items():
+            if key == "__metadata__":
+                continue
+            dtype_str = meta["dtype"]
+            shape = tuple(meta["shape"])
+            dstart, dend = meta["data_offsets"]
+            abs_start = data_section_offset + dstart
+            abs_end = data_section_offset + dend
+            f.seek(abs_start)
+            raw = f.read(abs_end - abs_start)
             torch_dtype = SAFE_DTYPE.get(dtype_str, torch.uint8)
-            tensor = torch.frombuffer(raw, dtype=torch_dtype).reshape(shape)
-            tensors[key] = tensor
+            tensors[key] = torch.frombuffer(raw, dtype=torch_dtype).reshape(shape)
     return tensors
 
 
