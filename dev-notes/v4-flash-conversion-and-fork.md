@@ -75,10 +75,70 @@ V4 Flash 有 `auto_map: {"AutoModelForCausalLM": "DeepseekV4ForCausalLM"}` 引�
 ## 优先级
 
 1. ✅ 确认 V4 Flash 存在 + index 可读
-2. → 读 convert_weight.py 在 V4 上的 dry-run（dry 模式：不写文件，只 log 哪些 weight 会被 dequant 哪些会被 keep）
-3. → 试路径 A：从 HF 下载 modeling_deepseek_v4.py
-4. → 试 BF16 转换 + 用 V3 类 serve（如果路径 A 失败）
+2. ✅ **convert_weight.py dry-run on V4 Flash（关键发现）**：
+   - Model index 完美解析：69187 keys / 33792 FP4 expert / 375 FP8 non-expert / 34167 scales
+   - **第一 shard 加载就炸**：`AttributeError: module 'torch' has no attribute 'float8_e8m0fnu'`
+   - **根因**：V4 用 `float8_e8m0fnu` (PyTorch 2.4+) 做 WKV fused QKV weight 的 scale。容器 torch 旧版本没这个 dtype attribute
+   - **修复方向**：在 fork 写 V4-specific 转换脚本（不用 dtype attribute，按 E8M0 字节 raw 解析）
+3. → 试 BF16 转换 + V3 类 serve
+4. → 试路径 A：HF 下载 modeling code
 5. → 评估 mHC 缺失的影响
+
+## V4 Flash weight 命名（dry-run 实际发现）
+
+| V3.2 | V4 Flash (实测) |
+|---|---|
+| `self_attn.q_a_proj.weight` | `attn.wq_a.weight` |
+| `self_attn.q_b_proj.weight` | `attn.wq_b.weight` |
+| `self_attn.kv_a_proj_with_mqa.weight` | `attn.wk_a.weight` + `attn.wv_a.weight`（Q/K/V 分离）|
+| `self_attn.kv_b_proj.weight` | `attn.wk_b.weight` + `attn.wv_b.weight` |
+| `self_attn.o_proj.weight` | `attn.wo_a.weight` + `attn.wo_b.weight`（**O LoRA**）|
+| N/A | `attn.wkv.weight`（**fused QKV，FP8 e8m0fnu**）|
+| N/A | `attn.attn_sink`（**V4 新增**）|
+| N/A | `attn.kv_norm.weight` + `attn.q_norm.weight`（**per-head RMSNorm**）|
+| N/A | `attn_norm.weight`（**post-attn norm**）|
+| `self_attn.indexer.wq_b` | `attn.indexer.wq_b`（DSA 一样）|
+| `mlp.experts.X.gate_proj.weight` | `ffn.experts.X.w1.weight`（**w1/w2/w3 替代 gate/up/down**）|
+| `shared_experts.gate_up_proj.weight` | 待确认 |
+| N/A | `layers.X.hc_attn_base/fn/scale` + `hc_ffn_base/fn/scale`（**mHC**）|
+| N/A | `hc_head_base/fn/scale`（**head-level mHC**）|
+
+**layer 0 完整 key 列表（实测，1565 keys/层）**：
+```
+layers.0.attn.attn_sink                              ← V4 新增（attention sink）
+layers.0.attn.kv_norm.weight                         ← V4 新增（KV norm）
+layers.0.attn.q_norm.weight                          ← V4 新增（Q norm）
+layers.0.attn.wkv.scale / wkv.weight                 ← V4 fused QKV (FP8 e8m0fnu scale)
+layers.0.attn.wo_a.scale / wo_a.weight               ← O LoRA down
+layers.0.attn.wo_b.scale / wo_b.weight               ← O LoRA up
+layers.0.attn.wq_a.scale / wq_a.weight               ← Q LoRA down
+layers.0.attn.wq_b.scale / wq_b.weight               ← Q LoRA up
+layers.0.attn.wk_a.scale / wk_a.weight               ← K LoRA down (V4 单独)
+layers.0.attn.wk_b.scale / wk_b.weight               ← K LoRA up
+layers.0.attn.wv_a.scale / wv_a.weight               ← V LoRA down
+layers.0.attn.wv_b.scale / wv_b.weight               ← V LoRA up
+layers.0.attn_norm.weight                            ← post-attention RMSNorm
+layers.0.ffn.experts.0.w1/w2/w3.{weight,scale}       ← 256 个 expert × 3 weights (FP4 MXFP4)
+layers.0.hc_attn_base/fn/scale                        ← mHC (V4 独有)
+layers.0.hc_ffn_base/fn/scale                         ← mHC
+```
+
+**专家权重的 w1/w2/w3 vs gate/up/down 命名约定**：
+- `w1` = gate_proj（input → intermediate）
+- `w2` = down_proj（intermediate → output，in MoE gate context）—— 注意：这是 **post-MoE-gate 的 down_proj**，不是普通 MLP 的 down_proj
+- `w3` = up_proj（input → intermediate）
+
+## 容器 torch 版本 vs V4 Flash 需求
+
+| dtype | 容器支持 | V4 用法 |
+|---|---|---|
+| `torch.float8_e4m3fn` | ✅（vllm_kunlun torch 2.0+）| 部分 FP8 权重（attn 一些） |
+| `torch.float8_e8m0fnu` | ❌（需要 torch 2.4+，容器是更早版本）| **WKV fused QKV 的 scale**（E8M0）|
+| `torch.bfloat16` | ✅ | norm, bias, gate, hc_* 等 |
+| `torch.float32` | ✅ | indexer.k_norm 等 |
+| FP4 (E2M1 packed in int8) | 需手动解析 | `ffn.experts.X.w1/w2/w3.weight` |
+
+**结论**：必须用 byte-level E8M0 解析，不能依赖 dtype attribute。
 
 ## 已 push commits（截至本文件）
 - `ac7d572` docs: pivot to DeepSeek V4 Flash research
