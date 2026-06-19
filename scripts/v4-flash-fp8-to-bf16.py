@@ -6,6 +6,12 @@ Patched version of the Aoripus convert_weight.py for V4 Flash compatibility:
   - E8M0 scale decode: works on container torch (no float8_e8m0fnu dtype attribute)
   - V4 weight naming: ffn.experts.X.w1/w2/w3, attn.wq_a, attn.wo_a, etc.
   - Pass-through BF16 keys: hc_*, attn_sink, norms, biases, embed, lm_head
+  - BYPASSES safetensors' dtype system entirely (it has a hardcoded
+    DTYPE_MAP that references torch.float8_e8m0fnu at import time;
+    monkey-patching the attribute after the fact doesn't help). We
+    use safe_open + get_slice + get_data() to read raw bytes, then
+    manually construct tensors with safe dtypes (uint8 for any
+    float8 variant). This works regardless of torch version.
 
 Usage:
   docker exec vllm-kunlun python /workspace/vLLM-Kunlun-Aoripus/scripts/v4-flash-fp8-to-bf16.py \
@@ -23,30 +29,6 @@ Notes:
   - Expected runtime: 30-60 min on CPU, ~5-10 min on XPU
 """
 
-# CRITICAL: Container's torch is older and lacks torch.float8_e8m0fnu.
-# safetensors tries to access this attribute when loading FP8 e4m3fn + e8m0fnu scale
-# weight pairs. We monkey-patch it to uint8 (e8m0fnu IS 1 byte) and decode
-# the E8M0 exponents ourselves via bitwise math.
-import torch as _torch
-if not hasattr(_torch, "float8_e8m0fnu"):
-    _torch.float8_e8m0fnu = _torch.uint8  # E8M0 is 1-byte; we handle decode manually
-# Also patch the dtypes mapping that safetensors/torch.py uses internally
-if not hasattr(_torch, "finfo"):
-    pass  # finfo is fine in any modern torch
-# Some safetensors versions do `torch.finfo(torch.float8_e8m0fnu)` which would fail.
-# Guard that too by pre-creating a minimal finfo.
-try:
-    _torch.finfo(_torch.float8_e8m0fnu)
-except (AttributeError, TypeError):
-    class _DummyFinfo:
-        bits = 8
-        min = 0.0
-        max = 1.0
-        eps = 0.0
-        smallest_normal = 0.0
-        tiny = 0.0
-    _torch.finfo = lambda dtype: _DummyFinfo()
-
 import argparse
 import json
 import os
@@ -56,7 +38,30 @@ from glob import glob
 from tqdm import tqdm
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors import safe_open
+from safetensors.torch import save_file
+
+
+# Safetensors dtype string -> safe torch dtype to read raw bytes as.
+# All float8 variants are 1 byte, so we read them as uint8 and decode
+# ourselves. bf16/f16/f32/i64 are read at their native dtype.
+SAFE_DTYPE = {
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "I8": torch.int8,
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "I64": torch.int64,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+    # V4-specific float8 variants: read as uint8 (1 byte each)
+    "F8_E8M0": torch.uint8,
+    "F8_E4M3": torch.uint8,
+    "F8_E5M2": torch.uint8,
+    "F4_E2M1": torch.uint8,  # FP4 packed (2 per byte)
+}
 
 
 BLOCK_SIZE = 128
@@ -93,6 +98,32 @@ def decode_e8m0_scale_bytewise(scale_bytes: torch.Tensor) -> torch.Tensor:
 def is_expert_weight(name: str) -> bool:
     """Check if a weight belongs to an expert (MoE) layer, excluding shared_experts."""
     return "experts" in name and "shared_experts" not in name
+
+
+def load_shard_safetensors(path):
+    """
+    Load all tensors from a safetensors shard using safe_open + get_slice +
+    get_data() to bypass the safetensors dtype system entirely.
+
+    safetensors.torch.load_file references torch.float8_e8m0fnu in its
+    internal DTYPE_MAP at import time, which the container's older
+    torch lacks. Monkey-patching torch after the fact does not help
+    because the DTYPE_MAP dict was already built. This helper reads
+    raw bytes per tensor and constructs the torch tensor manually
+    with a safe dtype (uint8 for any float8 variant).
+    """
+    tensors = {}
+    with safe_open(path, framework="pt") as f:
+        meta = f.metadata() or {}
+        for key in f.keys():
+            slice_ = f.get_slice(key)
+            dtype_str = meta[key]["dtype"] if key in meta else None
+            shape = slice_.get_shape()
+            raw = bytes(slice_.get_data())
+            torch_dtype = SAFE_DTYPE.get(dtype_str, torch.uint8)
+            tensor = torch.frombuffer(raw, dtype=torch_dtype).reshape(shape)
+            tensors[key] = tensor
+    return tensors
 
 
 def dequant_fp4_weight(weight_packed: torch.Tensor, scale_bytes: torch.Tensor) -> torch.Tensor:
@@ -237,7 +268,7 @@ def main(fp8_path, bf16_path, device="cpu"):
 
     for safetensor_file in tqdm(safetensor_files, desc="Converting FP8/FP4 -> BF16"):
         file_name = os.path.basename(safetensor_file)
-        current_state_dict = load_file(safetensor_file, device="cpu")
+        current_state_dict = load_shard_safetensors(safetensor_file)
         new_state_dict = {}
 
         for weight_name, weight in current_state_dict.items():
@@ -255,9 +286,8 @@ def main(fp8_path, bf16_path, device="cpu"):
                         # Load from a different shard
                         scale_file = weight_map.get(scale_inv_name)
                         if scale_file:
-                            scale_inv = load_file(
-                                os.path.join(fp8_path, scale_file),
-                                device="cpu"
+                            scale_inv = load_shard_safetensors(
+                                os.path.join(fp8_path, scale_file)
                             )[scale_inv_name]
                         else:
                             raise KeyError(scale_inv_name)
