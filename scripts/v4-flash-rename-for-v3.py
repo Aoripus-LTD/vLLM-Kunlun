@@ -8,6 +8,7 @@ Peak memory: just the output tensors (~same size as input).
 """
 
 import argparse
+import gc
 import json
 import mmap
 import os
@@ -16,8 +17,11 @@ import shutil
 import time
 from glob import glob
 
+import numpy as np
 import torch
 from safetensors.torch import save_file
+
+gc.disable()  # Disable GC: 256 expert fusions/shard cause excessive GC pauses
 
 
 SAFE_DTYPE = {
