@@ -13,9 +13,11 @@ export XACC_ENABLE_XPU=1
 export XPURT_DISPATCH_MODE=0
 export OMP_NUM_THREADS=8
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export SEEKX_API_KEY=${SEEKX_API_KEY:-sk-CHANGE-ME-BEFORE-DEPLOY}
 
 setsid nohup python -m vllm.entrypoints.openai.api_server \
   --host 0.0.0.0 \
+  --api-key ${SEEKX_API_KEY} \
   --port 8356 \
   --model /home/models/Qwen35-122B-A10B-AB \
   --trust-remote-code \
