@@ -28,7 +28,9 @@ setsid nohup python -m vllm.entrypoints.openai.api_server \
   --block-size 128 \
   --distributed-executor-backend mp \
   --served-model-name qwen3.5-122b-a10b \
+  --chat-template /home/models/Qwen35-122B-A10B-AB/chat_template_seekx.jinja \
   --enforce-eager \
+  --reasoning-parser qwen3 \
   --limit-mm-per-prompt '{"image": 0, "video": 0}' \
   > /tmp/qwen122b_serve.log 2>&1 < /dev/null &
 disown
