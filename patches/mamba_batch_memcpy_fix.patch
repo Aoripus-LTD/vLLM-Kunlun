@@ -1,0 +1,44 @@
+19,37d18
+< @triton.jit
+< def batch_memcpy_kernel(src_ptrs, dst_ptrs, sizes, BLOCK_SIZE: tl.constexpr):
+<     pid = tl.program_id(0)
+< 
+<     src_ptr = tl.load(src_ptrs + pid)
+<     dst_ptr = tl.load(dst_ptrs + pid)
+<     size = tl.load(sizes + pid)
+< 
+<     offsets = tl.arange(0, BLOCK_SIZE)
+<     for i in range(0, size, BLOCK_SIZE):
+<         mask = (i + offsets) < size
+< 
+<         curr_src_ptr = (src_ptr + i + offsets).to(tl.pointer_type(tl.uint8))
+<         curr_dst_ptr = (dst_ptr + i + offsets).to(tl.pointer_type(tl.uint8))
+< 
+<         data = tl.load(curr_src_ptr, mask=mask)
+<         tl.store(curr_dst_ptr, data, mask=mask)
+< 
+< 
+38a20,21
+>     # Kunlun: Triton kernel 不可用，改用 libxpurt 的 xpu_memcpy
+>     import ctypes
+43,45c26,41
+<     grid = (batch,)
+<     BLOCK_SIZE = 1024
+<     batch_memcpy_kernel[grid](src_ptrs, dst_ptrs, sizes, BLOCK_SIZE=BLOCK_SIZE)
+---
+>     _libxpurt = ctypes.CDLL("libxpurt.so.2")
+>     _libxpurt.xpu_memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+>     _libxpurt.xpu_memcpy.restype = ctypes.c_int
+> 
+>     # 一次性同步 + 拷到 CPU
+>     torch.cuda.synchronize()
+>     src_list = src_ptrs.cpu().tolist()
+>     dst_list = dst_ptrs.cpu().tolist()
+>     size_list = sizes.cpu().tolist()
+> 
+>     # 3 = cudaMemcpyDeviceToDevice
+>     for i in range(batch):
+>         size = size_list[i]
+>         if size <= 0:
+>             continue
+>         _libxpurt.xpu_memcpy(dst_list[i], src_list[i], size, 3)
