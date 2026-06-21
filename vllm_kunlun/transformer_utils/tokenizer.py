@@ -127,7 +127,7 @@ def kunlun_get_tokenizer(
                 revision=revision,
                 **kwargs,
             )
-        except ValueError as e:
+        except (ValueError, TypeError) as e:
             # If the error pertains to the tokenizer class not existing or not
             # currently being imported,
             # suggest using the --trust-remote-code flag.
@@ -146,7 +146,7 @@ def kunlun_get_tokenizer(
                 raise RuntimeError(err_msg) from e
 
             # FIXME: Temporary compatibility code for new config format. Remove after vLLM upgrade.
-            if "TokenizersBackend" in str(e):
+            if "TokenizersBackend" in str(e) or "NoneType" in str(e) or "vocab_file" in str(e) or "merges_file" in str(e):
                 logger.warning(
                     "TokenizerBackend not supported, patching tokenizer_config.json "
                     "and loading with PreTrainedTokenizerFast."
@@ -158,6 +158,8 @@ def kunlun_get_tokenizer(
                         "tokenizer_config.json",
                         "special_tokens_map.json",
                         "added_tokens.json",
+                        "vocab.json",
+                        "merges.txt",
                         "chat_template.jinja",
                         "generation_config.json",
                     ]

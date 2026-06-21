@@ -137,8 +137,11 @@ device_platform = _check_platform()
 is_amd = (device_platform == 'amd')
 is_intel = (device_platform == 'nvidia')
 is_nvidia = (device_platform == 'nvidia')
-is_intel_alchemist = (is_intel
-                      and 'Intel(R) Arc(TM) A' in torch.xpu.get_device_name(0))
+try:
+    _xpu_name = torch.xpu.get_device_name(0) if torch.xpu.is_available() else ''
+except Exception:
+    _xpu_name = ''
+is_intel_alchemist = (is_intel and 'Intel(R) Arc(TM) A' in _xpu_name)
 is_nvidia_hopper = (is_nvidia
                     and ('NVIDIA H' in torch.cuda.get_device_name(0)
                          or torch.cuda.get_device_capability()[0] >= 9))
